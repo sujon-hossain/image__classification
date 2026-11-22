@@ -1,3 +1,4 @@
+import io
 import pickle
 import time
 from pathlib import Path
@@ -32,10 +33,10 @@ CLASS_ICONS = {
 }
 MEAN, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
 
-# For each model, the first file name in "candidates" that exists is used.
+# For each model, the candidate files are tried in order until one loads correctly.
 MODELS = {
     "Fine-tuned": {
-        "candidates": ["data1.pkl", "best_b_fixed.pth", "best_b.pth"],
+        "candidates": ["best_b_fixed.pth", "best_b.pth", "data1.pkl"],
         "color": "#06B6D4",
         "gradient": "linear-gradient(135deg, #06B6D4 0%, #3B82F6 100%)",
         "badge_bg": "rgba(6, 182, 212, 0.14)",
@@ -43,7 +44,7 @@ MODELS = {
         "note": "All convolutional blocks & classifier head fine-tuned on CIFAR-10",
     },
     "Frozen": {
-        "candidates": ["data2.pkl", "best_a_fixed.pth", "best_a.pth"],
+        "candidates": ["best_a_fixed.pth", "best_a.pth", "data2.pkl"],
         "color": "#F43F5E",
         "gradient": "linear-gradient(135deg, #F43F5E 0%, #F97316 100%)",
         "badge_bg": "rgba(244, 63, 94, 0.14)",
@@ -52,11 +53,9 @@ MODELS = {
     },
 }
 
-# Resolve every model's weights file to a Path (the first candidate that exists,
-# otherwise the first candidate, so the sidebar can still show its name).
+# Full paths of the candidate weight files (tried in this order until one loads).
 for _info in MODELS.values():
-    _paths = [BASE_DIR / name for name in _info["candidates"]]
-    _info["file"] = next((p for p in _paths if p.exists()), _paths[0])
+    _info["paths"] = [str(BASE_DIR / name) for name in _info["candidates"]]
 
 transform = transforms.Compose([
     transforms.Resize((128, 128)),
@@ -74,33 +73,70 @@ def _to_state_dict(obj):
             if key in obj and isinstance(obj[key], (dict, nn.Module)):
                 return _to_state_dict(obj[key])
         return {k.replace("module.", "", 1): v for k, v in obj.items()}
-    raise ValueError(f"Unsupported checkpoint content: {type(obj)}")
+    raise ValueError(f"Unsupported checkpoint content: {type(obj).__name__}")
 
 
-@st.cache_resource
-def load_model(path_str: str):
-    path = Path(path_str)
-    has_weights = path.exists()
-    m = models.resnet18(weights=None if has_weights else models.ResNet18_Weights.DEFAULT)
-    if has_weights:
-        if path.read_bytes()[:120].startswith(b"version https://git-lfs"):
-            raise ValueError(f"{path.name} is a Git LFS pointer, not the real model file.")
-        try:
-            raw = torch.load(path, map_location="cpu", weights_only=True)
-        except pickle.UnpicklingError:
-            # Fallback for files you created yourself (e.g. a whole saved model).
-            # Never use this on files from sources you do not trust.
-            raw = torch.load(path, map_location="cpu", weights_only=False)
-        state = _to_state_dict(raw)
-        if "fc.1.weight" in state:      # checkpoint trained with the dropout head
-            m.fc = nn.Sequential(nn.Dropout(0.3), nn.Linear(m.fc.in_features, len(CLASSES)))
-        else:                           # original plain linear head
-            m.fc = nn.Linear(m.fc.in_features, len(CLASSES))
-        m.load_state_dict(state)
-    else:
-        m.fc = nn.Linear(m.fc.in_features, len(CLASSES))   # untrained head (fallback)
+def _read_checkpoint(path, data):
+    """Try several ways to read a checkpoint (a file path, or uploaded bytes)."""
+    def src():
+        return io.BytesIO(data) if data is not None else path
+
+    errors = []
+    try:                                   # 1) safe PyTorch load
+        return torch.load(src(), map_location="cpu", weights_only=True)
+    except Exception as e:
+        errors.append(f"torch.load(safe): {e}")
+    try:                                   # 2) full PyTorch load (only for your own files!)
+        return torch.load(src(), map_location="cpu", weights_only=False)
+    except Exception as e:
+        errors.append(f"torch.load(full): {e}")
+    try:                                   # 3) TorchScript model
+        return torch.jit.load(src(), map_location="cpu")
+    except Exception as e:
+        errors.append(f"torch.jit.load: {e}")
+    try:                                   # 4) plain pickle
+        with (io.BytesIO(data) if data is not None else open(path, "rb")) as f:
+            return pickle.load(f)
+    except Exception as e:
+        errors.append(f"pickle.load: {e}")
+    raise ValueError(" || ".join(errors))
+
+
+def _build_model(raw):
+    state = _to_state_dict(raw)
+    m = models.resnet18(weights=None)
+    if "fc.1.weight" in state:             # trained with the dropout head
+        m.fc = nn.Sequential(nn.Dropout(0.3), nn.Linear(m.fc.in_features, len(CLASSES)))
+    else:                                  # plain linear head
+        m.fc = nn.Linear(m.fc.in_features, len(CLASSES))
+    m.load_state_dict(state)
     m.eval()
-    return m, has_weights
+    return m
+
+
+@st.cache_resource(show_spinner="Loading model...")
+def load_model(paths: tuple, upload: bytes | None = None):
+    """Return (model, file_label, error_messages). model is None if nothing loads."""
+    sources = []
+    if upload:
+        sources.append(("uploaded file", None, upload))
+    for p in paths:
+        if Path(p).exists():
+            sources.append((Path(p).name, p, None))
+
+    errors = []
+    for label, path, data in sources:
+        try:
+            if path is not None:
+                with open(path, "rb") as f:
+                    if f.read(120).startswith(b"version https://git-lfs"):
+                        raise ValueError("this is a Git LFS pointer, not the real model file")
+            return _build_model(_read_checkpoint(path, data)), label, errors
+        except Exception as e:
+            errors.append(f"{label}: {e}")
+    if not sources:
+        errors.append("no weight file found next to the app")
+    return None, None, errors
 
 
 def predict(model, image: Image.Image) -> tuple[np.ndarray, float]:
@@ -349,13 +385,26 @@ with st.sidebar:
     contrast = st.slider("Contrast", 0.5, 1.5, 1.0, 0.05)
 
     st.divider()
-    st.markdown("### 🧠 Weights Status")
+    st.markdown("### 🧠 Model Weights")
+    uploads = {}
+    with st.expander("Upload weights manually (optional)"):
+        st.caption("Use this if the files in the repository do not load. Only upload files you created yourself.")
+        for m_name in MODELS:
+            w = st.file_uploader(f"{m_name} weights", type=["pth", "pt", "pkl"], key=f"w_{m_name}")
+            uploads[m_name] = w.getvalue() if w is not None else None
+
+    LOADED = {}
     for m_name, info in MODELS.items():
-        ok = info["file"].exists()
-        st.caption(
-            f"{'🟢' if ok else '🟡'} **{m_name}**: `{info['file'].name}` "
-            f"{'loaded' if ok else '(not found - fallback mode)'}"
-        )
+        model_obj, label, errs = load_model(tuple(info["paths"]), uploads[m_name])
+        LOADED[m_name] = model_obj
+        if model_obj is not None:
+            st.caption(f"🟢 **{m_name}**: `{label}` loaded")
+        else:
+            st.caption(f"🔴 **{m_name}**: no valid weights file")
+        if errs:
+            with st.expander(f"{m_name}: load details"):
+                for e in errs:
+                    st.code(e)
 
 # --------------------------------------------------------------------------
 # Header & Live Class Chips
@@ -464,19 +513,17 @@ with right:
             else ["Fine-tuned", "Frozen"]
         )
 
+        missing = [n for n in selected if LOADED[n] is None]
+        selected = [n for n in selected if LOADED[n] is not None]
+        for n in missing:
+            st.error(f"{n}: no valid weights file could be loaded. Open the sidebar for details, "
+                     "or upload the file there.")
+        if not selected:
+            st.stop()
+
         results, latencies = {}, {}
         for m_name in selected:
-            try:
-                m_obj, loaded = load_model(str(MODELS[m_name]["file"]))
-            except Exception as e:
-                st.error(f"{m_name}: could not load `{MODELS[m_name]['file'].name}`. {e}")
-                st.stop()
-            if not loaded:
-                st.warning(
-                    f"{m_name}: weights file not found, so these predictions "
-                    "are NOT trained results. Add the model file to the app folder."
-                )
-            results[m_name], latencies[m_name] = predict(m_obj, image)
+            results[m_name], latencies[m_name] = predict(LOADED[m_name], image)
 
         tops = {m_name: int(np.argmax(p)) for m_name, p in results.items()}
         predicted_set = set(tops.values())
