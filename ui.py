@@ -1,3 +1,4 @@
+import pickle
 import time
 from pathlib import Path
 
@@ -64,13 +65,33 @@ transform = transforms.Compose([
 ])
 
 
+def _to_state_dict(obj):
+    """Accept a state_dict, a whole saved model, or a dict that wraps one."""
+    if isinstance(obj, nn.Module):
+        obj = obj.state_dict()
+    if isinstance(obj, dict):
+        for key in ("state_dict", "model_state_dict", "model"):
+            if key in obj and isinstance(obj[key], (dict, nn.Module)):
+                return _to_state_dict(obj[key])
+        return {k.replace("module.", "", 1): v for k, v in obj.items()}
+    raise ValueError(f"Unsupported checkpoint content: {type(obj)}")
+
+
 @st.cache_resource
 def load_model(path_str: str):
     path = Path(path_str)
     has_weights = path.exists()
     m = models.resnet18(weights=None if has_weights else models.ResNet18_Weights.DEFAULT)
     if has_weights:
-        state = torch.load(path, map_location="cpu", weights_only=True)
+        if path.read_bytes()[:120].startswith(b"version https://git-lfs"):
+            raise ValueError(f"{path.name} is a Git LFS pointer, not the real model file.")
+        try:
+            raw = torch.load(path, map_location="cpu", weights_only=True)
+        except pickle.UnpicklingError:
+            # Fallback for files you created yourself (e.g. a whole saved model).
+            # Never use this on files from sources you do not trust.
+            raw = torch.load(path, map_location="cpu", weights_only=False)
+        state = _to_state_dict(raw)
         if "fc.1.weight" in state:      # checkpoint trained with the dropout head
             m.fc = nn.Sequential(nn.Dropout(0.3), nn.Linear(m.fc.in_features, len(CLASSES)))
         else:                           # original plain linear head
@@ -445,7 +466,11 @@ with right:
 
         results, latencies = {}, {}
         for m_name in selected:
-            m_obj, loaded = load_model(str(MODELS[m_name]["file"]))
+            try:
+                m_obj, loaded = load_model(str(MODELS[m_name]["file"]))
+            except Exception as e:
+                st.error(f"{m_name}: could not load `{MODELS[m_name]['file'].name}`. {e}")
+                st.stop()
             if not loaded:
                 st.warning(
                     f"{m_name}: weights file not found, so these predictions "
