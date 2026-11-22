@@ -31,24 +31,31 @@ CLASS_ICONS = {
 }
 MEAN, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
 
+# For each model, the first file name in "candidates" that exists is used.
 MODELS = {
     "Fine-tuned": {
-        "file": "data1.pkl",
-        "color": "#06B6D4",        # Electric Cyan
+        "candidates": ["data1.pkl", "best_b_fixed.pth", "best_b.pth"],
+        "color": "#06B6D4",
         "gradient": "linear-gradient(135deg, #06B6D4 0%, #3B82F6 100%)",
         "badge_bg": "rgba(6, 182, 212, 0.14)",
         "badge": "Full Network Adapted",
         "note": "All convolutional blocks & classifier head fine-tuned on CIFAR-10",
     },
     "Frozen": {
-        "file":  "data2.pkl",
-        "color": "#F43F5E",        # Vibrant Rose
+        "candidates": ["data2.pkl", "best_a_fixed.pth", "best_a.pth"],
+        "color": "#F43F5E",
         "gradient": "linear-gradient(135deg, #F43F5E 0%, #F97316 100%)",
         "badge_bg": "rgba(244, 63, 94, 0.14)",
         "badge": "Linear Probe Only",
         "note": "ImageNet feature extractor frozen; only final linear layer trained",
     },
 }
+
+# Resolve every model's weights file to a Path (the first candidate that exists,
+# otherwise the first candidate, so the sidebar can still show its name).
+for _info in MODELS.values():
+    _paths = [BASE_DIR / name for name in _info["candidates"]]
+    _info["file"] = next((p for p in _paths if p.exists()), _paths[0])
 
 transform = transforms.Compose([
     transforms.Resize((128, 128)),
@@ -62,10 +69,15 @@ def load_model(path_str: str):
     path = Path(path_str)
     has_weights = path.exists()
     m = models.resnet18(weights=None if has_weights else models.ResNet18_Weights.DEFAULT)
-    m.fc = nn.Linear(m.fc.in_features, len(CLASSES))
     if has_weights:
-        state_dict = torch.load(path, map_location="cpu", weights_only=True)
-        m.load_state_dict(state_dict)
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        if "fc.1.weight" in state:      # checkpoint trained with the dropout head
+            m.fc = nn.Sequential(nn.Dropout(0.3), nn.Linear(m.fc.in_features, len(CLASSES)))
+        else:                           # original plain linear head
+            m.fc = nn.Linear(m.fc.in_features, len(CLASSES))
+        m.load_state_dict(state)
+    else:
+        m.fc = nn.Linear(m.fc.in_features, len(CLASSES))   # untrained head (fallback)
     m.eval()
     return m, has_weights
 
@@ -319,7 +331,10 @@ with st.sidebar:
     st.markdown("### 🧠 Weights Status")
     for m_name, info in MODELS.items():
         ok = info["file"].exists()
-        st.caption(f"{'🟢' if ok else '🟡'} **{m_name}**: `{info['file'].name}` {'loaded' if ok else '(fallback mode)'}")
+        st.caption(
+            f"{'🟢' if ok else '🟡'} **{m_name}**: `{info['file'].name}` "
+            f"{'loaded' if ok else '(not found - fallback mode)'}"
+        )
 
 # --------------------------------------------------------------------------
 # Header & Live Class Chips
@@ -354,7 +369,11 @@ with left:
                 st.error("Invalid image file. Please upload a valid JPG or PNG.")
 
     with t_sample:
-        sample = st.radio("Choose sample:", ["None", "✈️ Airplane", "🚢 Cargo Ship", "🚗 Sports Car"], horizontal=True)
+        sample = st.radio(
+            "Choose sample:",
+            ["None", "✈️ Airplane", "🚢 Cargo Ship", "🚗 Sports Car"],
+            horizontal=True,
+        )
         if sample != "None" and raw_image is None:
             raw_image = make_sample_image(sample)
 
@@ -367,7 +386,11 @@ with left:
     if raw_image is not None:
         image = ImageEnhance.Brightness(raw_image).enhance(brightness)
         image = ImageEnhance.Contrast(image).enhance(contrast)
-        st.image(image, caption=f"Input Tensor: 128×128 RGB • Source: {image.width}×{image.height}px", width="stretch")
+        st.image(
+            image,
+            caption=f"Input Tensor: 128×128 RGB • Source: {image.width}×{image.height}px",
+            use_container_width=True,
+        )
 
 
 def build_bars(probs: np.ndarray, color: str, k: int) -> str:
@@ -422,7 +445,12 @@ with right:
 
         results, latencies = {}, {}
         for m_name in selected:
-            m_obj, _ = load_model(str(MODELS[m_name]["file"]))
+            m_obj, loaded = load_model(str(MODELS[m_name]["file"]))
+            if not loaded:
+                st.warning(
+                    f"{m_name}: weights file not found, so these predictions "
+                    "are NOT trained results. Add the model file to the app folder."
+                )
             results[m_name], latencies[m_name] = predict(m_obj, image)
 
         tops = {m_name: int(np.argmax(p)) for m_name, p in results.items()}
